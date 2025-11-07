@@ -1,8 +1,26 @@
-import os, hashlib, hmac, json
+import os, hashlib, hmac, json, logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse
+
 from apprise import Apprise
+
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+)
+
+LOGGER = logging.getLogger("webhook_relay")
+APPRISE_VERBOSE = os.getenv("APPRISE_VERBOSE", "false").lower() == "true"
+APPRISE_LOGGER = logging.getLogger("apprise")
+if APPRISE_VERBOSE:
+    APPRISE_LOGGER.setLevel(logging.DEBUG)
+    LOGGER.setLevel(logging.DEBUG)
+else:
+    APPRISE_LOGGER.setLevel(logging.INFO)
 
 APP = FastAPI()
 APPRISE_TARGETS = [u.strip() for u in os.getenv("APPRISE_URLS","").split(",") if u.strip()]
@@ -12,10 +30,59 @@ POLICY_ALLOWLIST = [p.strip() for p in os.getenv("POLICY_ALLOWLIST","").split(",
 HOST_LIMIT = int(os.getenv("HOST_LIMIT","25"))  # truncate long lists in messages
 
 def _apprise_client():
-    ap = Apprise()
+    ap = Apprise(debug=APPRISE_VERBOSE)
     for u in APPRISE_TARGETS:
         ap.add(u)
     return ap
+
+
+def _describe_plugin(plugin):
+    try:
+        return plugin.url(privacy=not APPRISE_VERBOSE)
+    except Exception:
+        return repr(plugin)
+
+
+def _notify_with_logging(ap, body, title):
+    try:
+        sequential_calls, parallel_calls = ap._create_notify_calls(body, title)
+    except TypeError:
+        LOGGER.exception("Apprise failed to prepare notification calls")
+        return False
+
+    total = len(sequential_calls) + len(parallel_calls)
+    LOGGER.info("Dispatching notification via Apprise to %d target(s)", total)
+
+    def dispatch(server, kwargs):
+        target = _describe_plugin(server)
+        LOGGER.debug("Notifying %s", target)
+        try:
+            result = server.notify(**kwargs)
+        except Exception:
+            LOGGER.exception("Notification attempt via %s raised an exception", target)
+            return False
+
+        if result:
+            LOGGER.debug("Notification via %s reported success", target)
+        else:
+            LOGGER.warning("Notification via %s reported failure", target)
+        return bool(result)
+
+    ok = True
+    for server, kwargs in sequential_calls:
+        ok = dispatch(server, kwargs) and ok
+
+    if parallel_calls:
+        LOGGER.debug("Notifying %d target(s) in parallel", len(parallel_calls))
+        with ThreadPoolExecutor() as executor:
+            future_map = {
+                executor.submit(dispatch, server, kwargs): server
+                for server, kwargs in parallel_calls
+            }
+            for future in as_completed(future_map):
+                ok = future.result() and ok
+
+    return ok
 
 def _fmt_host_line(h):
     # expected keys from Fleet example: id, display_name, url
@@ -96,8 +163,18 @@ async def fleet_webhook(request: Request):
         return JSONResponse({"ok": True, "ignored": True, "reason": "policy not allowlisted"})
 
     message = render_message(payload)
-    print(f"Message: {message}")
-    print(f"Targets: {APPRISE_TARGETS}")
+    LOGGER.debug("Rendered notification message:\n%s", message)
+    LOGGER.debug("Apprise targets: %s", APPRISE_TARGETS)
+
     ap = _apprise_client()
-    ok = ap.notify(body=message, title="Fleet Policy Failure")
+
+    try:
+        ok = _notify_with_logging(ap, message, "Fleet Policy Failure")
+    except Exception:
+        LOGGER.exception("Apprise notification pipeline raised an unhandled exception")
+        raise HTTPException(500, "Apprise notification failed")
+
+    if not ok:
+        LOGGER.error("One or more Apprise notifications failed")
+
     return JSONResponse({"ok": bool(ok)})
