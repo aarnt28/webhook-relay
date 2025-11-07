@@ -1,0 +1,18 @@
+services:
+  fleet-webhook-relay:
+    build: .
+    container_name: fleet-webhook-relay
+    restart: unless-stopped
+    environment:
+      # One or more Apprise URLs (comma-separated)
+      # Examples:
+      # - SMTP:  mailto://aaron@vipclouds.com:"vjrd vbda szmu bpxk"@smtp.gmail.com?to=help@vipclouds.com&from=backup-notifications@vipclouds.com
+      # - Slack: slack://xoxb-XXXXX-YYYYY-zzzzz@T12345678/#alerts
+      # - Teams: msteams://IncomingWebhook/long-url
+      APPRISE_URLS: "${APPRISE_URLS}"
+      SHARED_SECRET: "${SHARED_SECRET}"
+      REQUIRE_SECRET: "false"
+      # POLICY_ALLOWLIST: "Server Local Backup"   # optional
+      HOST_LIMIT: "25"
+    ports:
+      - "8675:8080"
